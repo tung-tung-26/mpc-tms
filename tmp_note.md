@@ -2,5 +2,5 @@
 2. 获取fmu中的fan2Table.qflow并绘制到RPM的subplot中，在legend中命名为QFLOW_blower，注意：获取到的单位为m^3/h帮我换算为m^3/s
 3. mpc控制过程中，如果打印warnings.warn("MPC优化未完全收敛（但仍返回结果）。"），这是什么意思呢？
 4. mpc控制的可调超参在哪里呢？
-5. 预热周期iternum改成50
-6. 
+5. 预热周期warmup steps改成50
+6. 目前看到的运算结果，电机的温度在初始值60开始就一直微微往上到61、62,而控制理想温度设置为40，交给mpc控制时却发现一直将RPM_motor的控制增量设为最大负值，为什么呢？
