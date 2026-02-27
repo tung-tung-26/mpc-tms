@@ -1,14 +1,14 @@
 """
-热管理系统的短地平线MPC控制
+热管理系统的短视野MPC控制
 ========================================================
 
-演示如何使用简单的短地平线MPC（无终止成本）来控制
+演示如何使用简单的短视野MPC（无终止成本）来控制
 黑盒热管理FMU系统。
 
 主要组件:
 - ThermalMPCCost: 热管理的成本函数
 - MPCThermalSystem: 简化的系统模型（用于MPC预测）
-- ThermalMPCControllerDelta: 增量型短地平线MPC（无终止成本）
+- ThermalMPCControllerDelta: 增量型短视野MPC（无终止成本）
 - EnhancedFMUITMS: FMU环境包装
 - 完整的仿真和绘图工具
 
@@ -348,12 +348,12 @@ def convert_bounds(bounds: Union[Tuple, List]) -> List[Tuple]:
 
 
 # ============================================================================
-# 增量型短地平线MPC控制器（无终止成本）
+# 增量型短视野MPC控制器（无终止成本）
 # ============================================================================
 class ThermalMPCControllerDelta:
     """
-    热管理用的增量型短地平线MPC。
-    - 不使用终止成本，只在预测地平线内累积单步成本
+    热管理用的增量型短视野MPC。
+    - 不使用终止成本，只在预测视野内累积单步成本
     - 使用增量控制（更平稳）
     - 支持每个部件不同的增量约束和绝对转速约束
     """
@@ -368,7 +368,7 @@ class ThermalMPCControllerDelta:
         system : MPCThermalSystem
             用于预测的系统模型
         horizon : int
-            预测地平线（N）
+            预测视野（N）
         cost_fn : ThermalMPCCost, 可选
             成本函数（若为None则使用默认值）
         """
@@ -479,7 +479,7 @@ class ThermalMPCControllerDelta:
         delta_u_seq : np.ndarray (m x N)
             最优增量控制序列
         cost_seq : np.ndarray (N,)
-            地平线上的单步成本
+            视野上的单步成本
         x_traj : np.ndarray (n x N+1)
             预测的状态轨迹
         """
@@ -981,7 +981,7 @@ def run_thermal_mpc_simulation(
     sim_steps : int
         仿真步数（不包括预热步数）
     horizon : int
-        MPC预测地平线
+        MPC预测视野
     seed : int
         随机种子
     controller_name : str
@@ -1064,7 +1064,7 @@ def run_thermal_mpc_simulation(
     print(f"  - RPM设定: blower={warmup_rpm_array[0]:.0f}, comp={warmup_rpm_array[1]:.0f}, "
           f"batt={warmup_rpm_array[2]:.0f}, motor={warmup_rpm_array[3]:.0f}")
     print(f"MPC控制: {sim_steps} 步")
-    print(f"  - 预测地平线: {horizon}")
+    print(f"  - 预测视野: {horizon}")
     print(f"  - 增量约束与绝对转速约束已配置")
     print("=" * 150)
 
@@ -1514,7 +1514,7 @@ def print_summary_statistics(results: Dict):
 # ============================================================================
 if __name__ == "__main__":
     print("\n" + "=" * 150)
-    print("短地平线增量型MPC热管理系统控制（FMU）- 带预热阶段")
+    print("短视野增量型MPC热管理系统控制（FMU）- 带预热阶段")
     print("=" * 150 + "\n")
 
     # 运行仿真
