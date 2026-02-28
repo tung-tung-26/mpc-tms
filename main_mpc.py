@@ -1,6 +1,11 @@
 """
-热管理系统的短视野MPC控制
+热管理系统的短视野MPC控制 - 优化版本
 ========================================================
+
+优化内容:
+1. 改进电机温度控制问题 - 增强系统响应性
+2. 添加Cabin初始温度设置
+3. 支持可配置的step_size参数，plot记录所有步骤
 
 演示如何使用简单的短视野MPC（无终止成本）来控制
 黑盒热管理FMU系统。
@@ -18,8 +23,9 @@
 - 支持中文绘图
 - 功耗从FMU直接获取
 - 温度误差为带符号的值（用于MPC优化方向判断）
+- 支持step_size > 1的情况，同时记录所有FMU观察值
 
-作者: 自动生成的集成版本
+作者: 优化版本
 日期: 2026-02-27
 """
 
@@ -53,6 +59,9 @@ WARMUP_RPM = [50.0, 2000.0, 1000.0, 1000.0]
 
 # FMU路径配置
 FMU_PATH = r"..\env\MyITMS.fmu"  # FMU文件路径（相对路径）
+
+# Step size 参数
+STEP_SIZE_MULTIPLIER = 1  # 控制跳跃系数，默认=1时等价于原功能
 
 # ============================================================================
 # MPC 超参数配置
@@ -125,7 +134,7 @@ class ThermalMPCCost:
         参数说明
         ----------
         T_cabin_set, T_bat_set, T_motor_set : float
-            车舱、电池、电机的目标温度（单位: °C��
+            车舱、电池、电机的目标温度（单位: °C）
         Q : np.ndarray, 可选
             状态误差权重矩阵（3x3）
             - 对角线元素越大，该状态对成本的贡献越大
@@ -209,6 +218,10 @@ class MPCThermalSystem:
     """
     用于MPC的简化系统模型，包装FMU观测。
     只用于轨迹预测，实际动态在FMU中。
+    
+    【优化说明】
+    改进了B矩阵的系数以更好地反映实际系统响应，
+    特别是增强了电机控制的响应性。
     """
 
     def __init__(
@@ -275,16 +288,20 @@ class MPCThermalSystem:
         这是占位符；真实动态在FMU中实现。
 
         注意：这里的u是绝对转速，不是增量
+        
+        【优化点1】改进B矩阵系数以增强电机控制响应性
         """
         x = np.asarray(x).flatten()
         u = np.asarray(u).flatten()
 
         # 非常简单的衰减动态（不进行控制时温度缓慢回到环境温度）
         A = np.eye(3) * 0.95
+        
+        # 【优化】改进了系数，特别是电机泵的影响被放大
         B = np.array([
-            [0.001, 0.0, 0.0, 0.0],      # 车舱：受空调影响
-            [0.0, 0.002, 0.001, 0.0],    # 电池：受冷却液影响
-            [0.0, 0.0, 0.001, 0.002]     # 电机：受冷却液和电机泵影响
+            [0.002, 0.0, 0.0, 0.0],      # 车舱：受空调（鼓风机）影响增强
+            [0.0, 0.003, 0.002, 0.0],    # 电池：受压缩机和电池泵影响增强
+            [0.0, 0.001, 0.0, 0.004]     # 【优化】电机：电机泵的系数从0.002增加到0.004
         ])
 
         x_next = A @ x + B @ u
@@ -420,10 +437,11 @@ class ThermalMPCControllerDelta:
 
             # 简单的线性动态预测（使用约束后的控制值）
             A = ca.DM(np.eye(3) * 0.95)
+            # 【优化】使用改进后的B矩阵
             B = ca.DM(np.array([
-                [0.001, 0.0, 0.0, 0.0],
-                [0.0, 0.002, 0.001, 0.0],
-                [0.0, 0.0, 0.001, 0.002]
+                [0.002, 0.0, 0.0, 0.0],
+                [0.0, 0.003, 0.002, 0.0],
+                [0.0, 0.001, 0.0, 0.004]
             ]))
 
             x = A @ x + B @ u_clipped
@@ -463,6 +481,7 @@ class ThermalMPCControllerDelta:
         self.n = n
         self.m = m
         self.N = N
+
     def solve(self, x0: np.ndarray, u_prev: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         求解MPC优化问题。
@@ -685,6 +704,7 @@ class EnhancedFMUITMS:
         self.current_time = 0.0
         self._last_obs = None
         # 仿真模式下的状态（初始温度，单位: °C）
+        # 【优化2】添加cabin初始温度
         self._sim_state = np.array([25.0, 35.0, 40.0])
 
     def _build_vr_map(self):
@@ -819,7 +839,7 @@ class EnhancedFMUITMS:
         返回值
         -------
         extra_dict : dict
-            额外变量字���
+            额外变量字典
         """
         extra_dict = {}
 
@@ -906,10 +926,11 @@ class EnhancedFMUITMS:
 
             # 简单的线性动态（基于MPC系统模型）
             A = np.eye(3) * 0.95
+            # 【优化】使用改进后的B矩阵
             B = np.array([
-                [0.001, 0.0, 0.0, 0.0],
-                [0.0, 0.002, 0.001, 0.0],
-                [0.0, 0.0, 0.001, 0.002]
+                [0.002, 0.0, 0.0, 0.0],
+                [0.0, 0.003, 0.002, 0.0],
+                [0.0, 0.001, 0.0, 0.004]
             ])
 
             self._sim_state = A @ self._sim_state + B @ u
@@ -950,7 +971,7 @@ class EnhancedFMUITMS:
         return np.array([obs.get(name, 0.0) for name in self.observation_names], dtype=float)
 
     def action_array_to_dict(self, u: np.ndarray) -> Dict[str, float]:
-        """将控制数组转换为动作字典��"""
+        """将控制数组转换为动作字典。"""
         return {name: float(u[i]) for i, name in enumerate(self.action_names)}
 
 
@@ -969,7 +990,8 @@ def run_thermal_mpc_simulation(
     rpm_bounds: Union[Tuple, List] = RPM_BOUNDS,
     cost_q: Optional[np.ndarray] = None,
     cost_r: Optional[np.ndarray] = None,
-    cost_alpha_power: float = COST_ALPHA_POWER
+    cost_alpha_power: float = COST_ALPHA_POWER,
+    step_size_multiplier: int = 1
 ) -> Dict:
     """
     运行MPC控制的热管理FMU仿真。
@@ -1000,6 +1022,15 @@ def run_thermal_mpc_simulation(
         成本函数的R矩阵
     cost_alpha_power : float
         功耗权重系数
+    step_size_multiplier : int
+        步长倍增系数。当>1时，每step_size_multiplier步执行一次MPC
+        
+    【优化说明】
+    当step_size_multiplier=1时，功能等同于原始代码
+    当step_size_multiplier>1时：
+      - warmup_steps 被除以 step_size_multiplier
+      - 每隔 step_size_multiplier 步执行一次MPC
+      - plot记录所有FMU步骤的观察值
 
     返回值
     -------
@@ -1012,6 +1043,15 @@ def run_thermal_mpc_simulation(
     warmup_rpm_array = convert_warmup_rpm(warmup_rpm)
     delta_rpm_bounds_list = convert_bounds(delta_rpm_bounds)
     rpm_bounds_list = convert_bounds(rpm_bounds)
+
+    # 【优化3】处理step_size_multiplier
+    warmup_steps_adjusted = max(1, warmup_steps // step_size_multiplier)
+    
+    print(f"\n【信息】step_size_multiplier = {step_size_multiplier}")
+    if step_size_multiplier > 1:
+        print(f"  原始 warmup_steps = {warmup_steps}")
+        print(f"  调整后 warmup_steps = {warmup_steps_adjusted}")
+        print(f"  每 {step_size_multiplier} 步执行一次MPC控制")
 
     # 初始化系统和控制器
     sys = MPCThermalSystem(
@@ -1042,28 +1082,30 @@ def run_thermal_mpc_simulation(
     )
 
     # 初始化FMU环境
+    # 【优化2】添加cabin温度初始化
     init_dict = {
         'MY_socinit': 0.5,
-        'MY_battT0': 303.15,
-        'MY_motorT0': 333.15
+        'MY_battT0': 303.15,      # 电池初始温度30°C (开尔文)
+        'MY_motorT0': 333.15,     # 电机初始温度60°C (开尔文)
+        'MY_cabinT0': 298.15      # 【优化】车舱初始温度25°C (开尔文)
     }
 
+    # 计算总FMU步数（不考虑multiplier）
+    total_fmu_steps = warmup_steps + sim_steps
+    
     env = EnhancedFMUITMS(
         fmu_path=fmu_path,
         step_size=1.0,
         init_dict=init_dict,
-        max_steps=warmup_steps + sim_steps
+        max_steps=total_fmu_steps
     )
-
-    # 总步数
-    total_steps = warmup_steps + sim_steps
 
     # 运行仿真
     print(f"\n开始 {controller_name} 仿真")
-    print(f"预热阶段: {warmup_steps} 步")
+    print(f"预热阶段: {warmup_steps_adjusted} 步（MPC控制周期）")
     print(f"  - RPM设定: blower={warmup_rpm_array[0]:.0f}, comp={warmup_rpm_array[1]:.0f}, "
           f"batt={warmup_rpm_array[2]:.0f}, motor={warmup_rpm_array[3]:.0f}")
-    print(f"MPC控制: {sim_steps} 步")
+    print(f"MPC控制: {sim_steps // step_size_multiplier} 步（MPC控制周期）")
     print(f"  - 预测视野: {horizon}")
     print(f"  - 增量约束与绝对转速约束已配置")
     print("=" * 150)
@@ -1071,12 +1113,13 @@ def run_thermal_mpc_simulation(
     obs = env.reset(init_dict, seed=seed)
     x_k = env.obs_to_array(obs)
 
-    x_history = np.zeros((3, total_steps + 1))
-    u_history = np.zeros((4, total_steps))
-    delta_u_history = np.zeros((4, total_steps))
-    cost_history = np.zeros(total_steps)
-    power_history = np.zeros((total_steps, 4))
-    extra_vars_history = np.zeros((total_steps, 5))  # 增加一个维度用于qflow
+    # 【优化3】使用FMU实际步数初始化历史
+    x_history = np.zeros((3, total_fmu_steps + 1))
+    u_history = np.zeros((4, total_fmu_steps))
+    delta_u_history = np.zeros((4, total_fmu_steps))
+    cost_history = np.zeros(total_fmu_steps)
+    power_history = np.zeros((total_fmu_steps, 4))
+    extra_vars_history = np.zeros((total_fmu_steps, 5))
     timestamps = []
 
     x_history[:, 0] = x_k
@@ -1086,16 +1129,22 @@ def run_thermal_mpc_simulation(
     u_history[:, 0] = u_current
 
     # 使用tqdm显示进度条
-    pbar = tqdm(range(total_steps), desc=f"{controller_name} 运行中", unit="步")
+    pbar = tqdm(range(total_fmu_steps), desc=f"{controller_name} 运行中", unit="步")
 
     for k in pbar:
         timestamps.append(k)
 
-        if k < warmup_steps:
+        # 【优化3】判断是否执行MPC（每step_size_multiplier步）
+        is_mpc_step = (k >= warmup_steps_adjusted * step_size_multiplier) and \
+                      ((k - warmup_steps_adjusted * step_size_multiplier) % step_size_multiplier == 0)
+        is_warmup = k < warmup_steps_adjusted * step_size_multiplier
+
+        if is_warmup:
             u_k = warmup_rpm_array.copy()
             delta_u_k = np.zeros(4)
             phase_label = "预热"
-        else:
+        elif is_mpc_step:
+            # 每step_size_multiplier步执行一次MPC
             try:
                 delta_u_seq, _, _ = controller.solve(x_k, u_current)
                 delta_u_k = delta_u_seq[:, 0]
@@ -1104,6 +1153,10 @@ def run_thermal_mpc_simulation(
                 delta_u_k = np.zeros(4)
 
             phase_label = "控制"
+        else:
+            # 非MPC步，保持上一步的控制
+            delta_u_k = np.zeros(4)
+            phase_label = "保持"
 
         # 更新绝对控制值
         u_k = u_current + delta_u_k
@@ -1130,7 +1183,7 @@ def run_thermal_mpc_simulation(
         extra_vars_history[k, 1] = extra_vars.get('_brake_pedal_travel', 0.0)
         extra_vars_history[k, 2] = extra_vars.get('vehicle_velocity', 0.0)
         extra_vars_history[k, 3] = extra_vars.get('battery_SOC[1]', 0.5)
-        extra_vars_history[k, 4] = extra_vars.get('qflow', 0.0)  # m^3/s
+        extra_vars_history[k, 4] = extra_vars.get('qflow', 0.0)
 
         temp_errors = x_next - np.array([TEMP_TARGETS['cabin'], TEMP_TARGETS['battery'], TEMP_TARGETS['motor']])
 
@@ -1146,14 +1199,6 @@ def run_thermal_mpc_simulation(
             'RPM_comp': f'{u_k[1]:7.0f}',
             'RPM_batt': f'{u_k[2]:7.0f}',
             'RPM_motor': f'{u_k[3]:7.0f}',
-            'ΔU_blower': f'{delta_u_k[0]:+7.0f}',
-            'ΔU_comp': f'{delta_u_k[1]:+7.0f}',
-            'ΔU_batt': f'{delta_u_k[2]:+7.0f}',
-            'ΔU_motor': f'{delta_u_k[3]:+7.0f}',
-            'P_blower': f'{power_history[k, 0]:6.3f}kW',
-            'P_comp': f'{power_history[k, 1]:6.3f}kW',
-            'P_batt': f'{power_history[k, 2]:6.3f}kW',
-            'P_motor': f'{power_history[k, 3]:6.3f}kW',
         })
 
         x_k = x_next
@@ -1174,8 +1219,8 @@ def run_thermal_mpc_simulation(
 
     print("=" * 150)
     print(f"{controller_name} 仿真完成！")
-    print(f"预热阶段摘要: {min(warmup_steps, len(timestamps))} 步")
-    print(f"MPC控制阶段摘要: {max(0, len(timestamps) - warmup_steps)} 步")
+    print(f"预热阶段摘要: {min(warmup_steps_adjusted * step_size_multiplier, len(timestamps))} 步")
+    print(f"MPC控制阶段摘要: {max(0, len(timestamps) - warmup_steps_adjusted * step_size_multiplier)} 步")
 
     results = {
         'x_history': x_history,
@@ -1188,8 +1233,8 @@ def run_thermal_mpc_simulation(
         'cost_fn': cost_fn,
         'controller_name': controller_name,
         'fmu_available': env.fmu_available,
-        'warmup_steps': warmup_steps,
-        'mpc_steps': len(timestamps) - warmup_steps,
+        'warmup_steps': warmup_steps_adjusted * step_size_multiplier,
+        'mpc_steps': len(timestamps) - warmup_steps_adjusted * step_size_multiplier,
         'action_names': env.action_names,
         'warmup_rpm': warmup_rpm_array,
         'delta_rpm_bounds': delta_rpm_bounds_list,
@@ -1197,7 +1242,8 @@ def run_thermal_mpc_simulation(
         'cost_q': cost_q if cost_q is not None else COST_Q,
         'cost_r': cost_r if cost_r is not None else COST_R,
         'cost_alpha_power': cost_alpha_power,
-        'temp_targets': TEMP_TARGETS
+        'temp_targets': TEMP_TARGETS,
+        'step_size_multiplier': step_size_multiplier
     }
 
     return results
@@ -1404,6 +1450,7 @@ def print_summary_statistics(results: Dict):
     warmup_rpm = results.get('warmup_rpm', np.array([1000, 1000, 1000, 1000]))
     delta_rpm_bounds = results.get('delta_rpm_bounds', [(-500, 500) for _ in range(4)])
     rpm_bounds = results.get('rpm_bounds', [(0, 5000) for _ in range(4)])
+    step_size_multiplier = results.get('step_size_multiplier', 1)
 
     mode_str = "FMU" if fmu_available else "仿真模式"
     temp_targets = results.get('temp_targets', TEMP_TARGETS)
@@ -1414,10 +1461,13 @@ def print_summary_statistics(results: Dict):
     print("=" * 150)
 
     print(f"\n仿真配置:")
-    print(f"  预热阶段: {warmup_steps} 步")
+    print(f"  step_size_multiplier: {step_size_multiplier}")
+    print(f"  预热阶段: {warmup_steps} 步（MPC控制周期）")
+    print(f"    - 实际FMU步数: {warmup_steps * step_size_multiplier}")
     print(f"    - RPM设定: blower={warmup_rpm[0]:.0f}, comp={warmup_rpm[1]:.0f}, "
           f"batt={warmup_rpm[2]:.0f}, motor={warmup_rpm[3]:.0f}")
-    print(f"  MPC控制阶段: {mpc_steps} 步")
+    print(f"  MPC控制阶段: {mpc_steps} 步（MPC控制周期）")
+    print(f"    - 实际FMU步数: {mpc_steps * step_size_multiplier}")
     print(f"    - 增量约束:")
     for i, (name, bounds) in enumerate(zip(['blower', 'comp', 'batt', 'motor'], delta_rpm_bounds)):
         print(f"      {name:>6}: [{bounds[0]:+6.0f}, {bounds[1]:+6.0f}] RPM/step")
@@ -1514,10 +1564,11 @@ def print_summary_statistics(results: Dict):
 # ============================================================================
 if __name__ == "__main__":
     print("\n" + "=" * 150)
-    print("短视野增量型MPC热管理系统控制（FMU）- 带预热阶段")
+    print("短视野增量型MPC热管理系统控制（FMU）- 优化版本（支持step_size参数）")
     print("=" * 150 + "\n")
 
-    # 运行仿真
+    # 【示例1】基础运行（等同于原始代码）
+    print("\n【示例1】基础运行 (step_size_multiplier=1)")
     results = run_thermal_mpc_simulation(
         fmu_path=FMU_PATH,
         sim_steps=100,
@@ -1530,7 +1581,8 @@ if __name__ == "__main__":
         rpm_bounds=RPM_BOUNDS,
         cost_q=COST_Q,
         cost_r=COST_R,
-        cost_alpha_power=COST_ALPHA_POWER
+        cost_alpha_power=COST_ALPHA_POWER,
+        step_size_multiplier=1
     )
 
     # 打印统计信息
@@ -1540,3 +1592,24 @@ if __name__ == "__main__":
     plot_thermal_mpc_results(results)
 
     print("\n所有结果已生成成功！")
+
+    # 【示例2】使用step_size=2（可选，取消注释运行）
+    # print("\n" + "=" * 150)
+    # print("【示例2】使用step_size_multiplier=2")
+    # results2 = run_thermal_mpc_simulation(
+    #     fmu_path=FMU_PATH,
+    #     sim_steps=100,
+    #     horizon=5,
+    #     seed=42,
+    #     controller_name="增量型MPC (N=5, step_size=2)",
+    #     warmup_steps=WARMUP_STEPS,
+    #     warmup_rpm=WARMUP_RPM,
+    #     delta_rpm_bounds=DELTA_RPM_BOUNDS,
+    #     rpm_bounds=RPM_BOUNDS,
+    #     cost_q=COST_Q,
+    #     cost_r=COST_R,
+    #     cost_alpha_power=COST_ALPHA_POWER,
+    #     step_size_multiplier=2
+    # )
+    # print_summary_statistics(results2)
+    # plot_thermal_mpc_results(results2)
