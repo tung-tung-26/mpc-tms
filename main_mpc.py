@@ -83,23 +83,42 @@ RPM_BOUNDS = [
     (100.0, 2000.0)     # 电机泵（500-2000 RPM）
 ]
 
-# MPC 成本函数的权重超参数
-# 温度目标值（°C）
-TEMP_TARGETS = {
-    'cabin': 25.0,
-    'battery': 35.0,
-    'motor': 40.0
-}
+# ============================================================================
+# 系统参数配置类
+# ============================================================================
+class SystemParameters:
+    """集中管理热管理系统的所有参数，消除重复定义。
 
-# 成本函数权重矩阵（已归一化）
-# Q: 状态误差权重 (温度跟踪误差)
-COST_Q = np.diag([10.0, 5.0, 5.0])  # [车舱, 电池, 电机]
+    所有超参数均在此处统一定义，其他模块通过引用此类获取参数，
+    确保全局配置自动同步，修改超参数只需改动此处。
+    """
 
-# R: 控制增量权重 (平滑性)
-COST_R = np.diag([0.1, 0.1, 0.1, 0.1])  # [鼓风机, 压缩机, 电池泵, 电机泵]
+    # 温度目标值（°C）
+    TEMP_TARGETS = {
+        'cabin': 25.0,
+        'battery': 35.0,
+        'motor': 40.0
+    }
 
-# alpha_power: 功耗权重系数
-COST_ALPHA_POWER = 1e-4
+    # 成本函数权重矩阵
+    COST_Q = np.diag([10.0, 5.0, 5.0])             # 状态误差权重 [车舱, 电池, 电机]
+    COST_R = np.diag([0.1, 0.1, 0.1, 0.1])         # 控制增量权重 [鼓风机, 压缩机, 电池泵, 电机泵]
+    COST_ALPHA_POWER = 1e-4                         # 功耗权重系数
+
+    # 系统动态矩阵（用于MPC预测）
+    A_DYNAMICS = np.eye(3) * 0.95
+    B_DYNAMICS = np.array([
+        [0.002, 0.0,   0.0,   0.0  ],   # 车舱：受空调（鼓风机）影响
+        [0.0,   0.003, 0.002, 0.0  ],   # 电池：受压缩机和电池泵影响
+        [0.0,   0.001, 0.0,   0.004]    # 电机：电机泵影响（增强）
+    ])
+
+
+# MPC 成本函数的权重超参数（从 SystemParameters 引用，保持向后兼容）
+TEMP_TARGETS = SystemParameters.TEMP_TARGETS
+COST_Q = SystemParameters.COST_Q
+COST_R = SystemParameters.COST_R
+COST_ALPHA_POWER = SystemParameters.COST_ALPHA_POWER
 
 # ============================================================================
 # 成本函数
@@ -123,12 +142,12 @@ class ThermalMPCCost:
 
     def __init__(
         self,
-        T_cabin_set: float = 25.0,
-        T_bat_set: float = 35.0,
-        T_motor_set: float = 40.0,
+        T_cabin_set: float = SystemParameters.TEMP_TARGETS['cabin'],
+        T_bat_set: float = SystemParameters.TEMP_TARGETS['battery'],
+        T_motor_set: float = SystemParameters.TEMP_TARGETS['motor'],
         Q: Optional[np.ndarray] = None,
         R: Optional[np.ndarray] = None,
-        alpha_power: float = 1e-4
+        alpha_power: float = SystemParameters.COST_ALPHA_POWER
     ):
         """
         参数说明
@@ -155,13 +174,13 @@ class ThermalMPCCost:
 
         if Q is None:
             # 默认权重：车舱权重更大（舒适性优先）
-            self.Q = np.diag([10.0, 5.0, 5.0])
+            self.Q = SystemParameters.COST_Q
         else:
             self.Q = Q
 
         if R is None:
             # 增量控制的权重：对转速变化的惩罚
-            self.R = np.diag([0.1, 0.1, 0.1, 0.1])
+            self.R = SystemParameters.COST_R
         else:
             self.R = R
 
@@ -251,8 +270,8 @@ class MPCThermalSystem:
         self.dt = dt
 
         # 成本函数权重
-        self.Q = np.diag([10.0, 5.0, 5.0])
-        self.R = np.diag([0.1, 0.1, 0.1, 0.1])  # 增量控制的权重
+        self.Q = SystemParameters.COST_Q
+        self.R = SystemParameters.COST_R  # 增量控制的权重
 
         # 边界
         self.temp_bounds = (10.0, 60.0)  # 单位: °C
@@ -295,14 +314,8 @@ class MPCThermalSystem:
         u = np.asarray(u).flatten()
 
         # 非常简单的衰减动态（不进行控制时温度缓慢回到环境温度）
-        A = np.eye(3) * 0.95
-        
-        # 【优化】改进了系数，特别是电机泵的影响被放大
-        B = np.array([
-            [0.002, 0.0, 0.0, 0.0],      # 车舱：受空调（鼓风机）影响增强
-            [0.0, 0.003, 0.002, 0.0],    # 电池：受压缩机和电池泵影响增强
-            [0.0, 0.001, 0.0, 0.004]     # 【优化】电机：电机泵的系数从0.002增加到0.004
-        ])
+        A = SystemParameters.A_DYNAMICS
+        B = SystemParameters.B_DYNAMICS
 
         x_next = A @ x + B @ u
         x_next = np.clip(x_next, self.temp_bounds[0], self.temp_bounds[1])
@@ -436,13 +449,8 @@ class ThermalMPCControllerDelta:
             J += state_cost + control_cost
 
             # 简单的线性动态预测（使用约束后的控制值）
-            A = ca.DM(np.eye(3) * 0.95)
-            # 【优化】使用改进后的B矩阵
-            B = ca.DM(np.array([
-                [0.002, 0.0, 0.0, 0.0],
-                [0.0, 0.003, 0.002, 0.0],
-                [0.0, 0.001, 0.0, 0.004]
-            ]))
+            A = ca.DM(SystemParameters.A_DYNAMICS)
+            B = ca.DM(SystemParameters.B_DYNAMICS)
 
             x = A @ x + B @ u_clipped
 
@@ -925,13 +933,8 @@ class EnhancedFMUITMS:
             ])
 
             # 简单的线性动态（基于MPC系统模型）
-            A = np.eye(3) * 0.95
-            # 【优化】使用改进后的B矩阵
-            B = np.array([
-                [0.002, 0.0, 0.0, 0.0],
-                [0.0, 0.003, 0.002, 0.0],
-                [0.0, 0.001, 0.0, 0.004]
-            ])
+            A = SystemParameters.A_DYNAMICS
+            B = SystemParameters.B_DYNAMICS
 
             self._sim_state = A @ self._sim_state + B @ u
             self._sim_state = np.clip(self._sim_state, 10.0, 60.0)
