@@ -1,16 +1,19 @@
 """
-热管理系统的短视野MPC控制 - 优化版本
+热管理系统的短视野MPC控制 - 优化版本（参数管理集中化）
 ========================================================
 
 优化内容:
-1. 改进电机温度控制问题 - 增强系统响应性
-2. 添加Cabin初始温度设置
-3. 支持可配置的step_size参数，plot记录所有步骤
+1. 创建集中式参数管理类 (ConfigManager)
+2. 所有矩阵、权重、约束统一管理
+3. 改进电机温度控制问题 - 增强系统响应性
+4. 添加Cabin初始温度设置
+5. 支持可配置的step_size参数，plot记录所有步骤
 
 演示如何使用简单的短视野MPC（无终止成本）来控制
 黑盒热管理FMU系统。
 
 主要组件:
+- ConfigManager: 集中式参数管理
 - ThermalMPCCost: 热管理的成本函数
 - MPCThermalSystem: 简化的系统模型（用于MPC预测）
 - ThermalMPCControllerDelta: 增量型短视野MPC（无终止成本）
@@ -24,9 +27,10 @@
 - 功耗从FMU直接获取
 - 温度误差为带符号的值（用于MPC优化方向判断）
 - 支持step_size > 1的情况，同时记录所有FMU观察值
+- 所有配置通过 ConfigManager 统一管理
 
-作者: 优化版本
-日期: 2026-02-27
+作者: 优化版本（参数管理集中化）
+日期: 2026-02-28
 """
 
 import numpy as np
@@ -40,6 +44,8 @@ from datetime import datetime
 from collections import defaultdict
 import pathlib
 from tqdm import tqdm
+from dataclasses import dataclass, field
+import json
 
 # ============================================================================
 # 配置中文字体
@@ -51,55 +57,249 @@ rcParams['axes.unicode_minus'] = False  # 防止负号显示为方块
 # 常数定义
 # ============================================================================
 K_TO_C = 273.15  # 开尔文到摄氏度的转换常数
-WARMUP_STEPS = 50  # FMU预热步数（不施加控制）
-
-# 预热阶段的固定转速值（list形式，为4个部件分别设定）
-# [鼓风机, 压缩机, 电池泵, 电机泵]
-WARMUP_RPM = [50.0, 2000.0, 1000.0, 1000.0]
-
-# FMU路径配置
-FMU_PATH = r"..\env\MyITMS.fmu"  # FMU文件路径（相对路径）
-
-# Step size 参数
-STEP_SIZE_MULTIPLIER = 1  # 控制跳跃系数，默认=1时等价于原功能
 
 # ============================================================================
-# MPC 超参数配置
+# 集中式参数管理类
 # ============================================================================
-# 增量型MPC的增量约束（可为每个部件分别设定）
-DELTA_RPM_BOUNDS = [
-    (-5.0, 5.0),        # 鼓风机（更小的变化范围）
-    (-100.0, 100.0),      # 压缩机
-    (-100.0, 100.0),      # 电池泵
-    (-100.0, 100.0)       # 电机泵
-]
+@dataclass
+class ThermalConfig:
+    """
+    热管理系统的集中式配置管理。
+    所有参数的单一真实来源（Single Source of Truth）。
+    """
 
-# MPC 的绝对转速约束上下界（可为每个部件分别设定）
-# 格式: list of (min, max) 或 单个 (min, max) 适用于所有部件
-RPM_BOUNDS = [
-    (0.0, 100.0),       # 鼓风机（最大300 RPM）
-    (100.0, 4000.0),    # 压缩机（500-2000 RPM）
-    (100.0, 2000.0),    # 电池泵（500-2000 RPM）
-    (100.0, 2000.0)     # 电机泵（500-2000 RPM）
-]
+    # ========================================================================
+    # 1. FMU和仿真配置
+    # ========================================================================
+    fmu_path: Optional[str] = r"..\env\MyITMS.fmu"
+    warmup_steps: int = 50  # FMU预热步数（不施加控制）
+    max_steps: int = 1800    # 每个episode的最大仿真步数
 
-# MPC 成本函数的权重超参数
-# 温度目标值（°C）
-TEMP_TARGETS = {
-    'cabin': 25.0,
-    'battery': 35.0,
-    'motor': 40.0
-}
+    # ========================================================================
+    # 2. 预热阶段配置
+    # ========================================================================
+    # 预热阶段的固定转速值（list形式，为4个部件分别设定）
+    # [鼓风机, 压缩机, 电池泵, 电机泵]
+    warmup_rpm: List[float] = field(default_factory=lambda: [5.0, 2000.0, 1000.0, 1000.0])
 
-# 成本函数权重矩阵（已归一化）
-# Q: 状态误差权重 (温度跟踪误差)
-COST_Q = np.diag([10.0, 5.0, 5.0])  # [车舱, 电池, 电机]
+    # ========================================================================
+    # 3. 转速约束配置
+    # ========================================================================
+    # 绝对转速约束上下界（每个部件分别设定）
+    # 格式: list of (min, max)
+    rpm_bounds: List[Tuple[float, float]] = field(default_factory=lambda: [
+        (1.0, 10.0),       # 鼓风机（最大300 RPM）
+        (100.0, 4000.0),    # 压缩机（500-2000 RPM）
+        (100.0, 2000.0),    # 电池泵（500-2000 RPM）
+        (100.0, 2000.0)     # 电机泵（500-2000 RPM）
+    ])
 
-# R: 控制增量权重 (平滑性)
-COST_R = np.diag([0.1, 0.1, 0.1, 0.1])  # [鼓风机, 压缩机, 电池泵, 电机泵]
+    # 增量型MPC的增量约束（每个部件分别设定）
+    delta_rpm_bounds: List[Tuple[float, float]] = field(default_factory=lambda: [
+        (-5.0, 5.0),        # 鼓风机（更小的变化范围）
+        (-100.0, 100.0),    # 压缩机
+        (-100.0, 100.0),    # 电池泵
+        (-100.0, 100.0)     # 电机泵
+    ])
 
-# alpha_power: 功耗权重系数
-COST_ALPHA_POWER = 1e-4
+    # ========================================================================
+    # 4. 温度目标值配置
+    # ========================================================================
+    temp_targets: Dict[str, float] = field(default_factory=lambda: {
+        'cabin': 25.0,
+        'battery': 35.0,
+        'motor': 40.0
+    })
+
+    # ========================================================================
+    # 5. 初始温度设置（开尔文）
+    # ========================================================================
+    init_cabin_temp_K: float = 308.15    # 车舱初始温度35°C (开尔文)
+    init_battery_temp_K: float = 313.15  # 电池初始温度40°C (开尔文)
+    init_motor_temp_K: float = 333.15    # 电机初始温度60°C (开尔文)
+
+    # ========================================================================
+    # 6. MPC成本函数权重配置
+    # ========================================================================
+    # COST_Q: 状态误差权重矩阵 (3x3 对角矩阵)
+    # 状态误差权重。值越大，温度控制越精准
+    # [车舱, 电池, 电机] - 对角线元素
+    cost_q_diag: List[float] = field(default_factory=lambda: [100.0, 5.0, 5.0])
+
+    # COST_R: 控制增量权重矩阵 (4x4 对角矩阵)
+    # 控制增量权重。值越大，动作越平滑。
+    # [鼓风机, 压缩机, 电池泵, 电机泵] - 对角线元素
+    cost_r_diag: List[float] = field(default_factory=lambda: [0.1, 0.1, 0.1, 0.1])
+
+    # COST_ALPHA_POWER: 功耗权重系数
+    # 功耗惩罚系数。直接惩罚总功率消耗。值越大越省电，但可能牺牲温度跟踪性能。
+    cost_alpha_power: float = 1e-8
+
+    # ========================================================================
+    # 7. 系统动态模型配置 (A矩阵和B矩阵)
+    # ========================================================================
+    # A矩阵：衰减系数 (x_{k+1} = A*x_k + B*u_k)
+    # 状态转移矩阵。代表温度的自然衰减/惯性系数（对角线 0.95 表示每一步保留 95% 的温度状态）。
+    # 这里使用标量形式（对角矩阵）
+    dynamics_a_decay: float = 0.95
+
+    # B矩阵：控制输入影响系数 (3x4 矩阵)
+    #         B = np.array([
+    #         [0.002,  0.0,    0.0,     0.0],       # ← 行0: 车舱温度 (T_cabin)
+    #         [0.0,    0.003, -0.002,   0.0],       # ← 行1: 电池温度 (T_battery)
+    #         [0.0,    0.001,  0.0,    -0.004]      # ← 行2: 电机温度 (T_motor)
+    #     ])
+    #          ↓      ↓       ↓        ↓
+    #        RPM_  RPM_    RPM_     RPM_
+    #      blower  comp    batt    motor
+    # 【优化】改进了系数以增强电机控制响应性
+    # 行: [车舱温度, 电池温度, 电机温度]
+    # 列: [鼓风机, 压缩机, 电池泵, 电机泵]
+    dynamics_b_matrix: List[List[float]] = field(default_factory=lambda: [
+        [-0.002, -0.002, 0.0, 0.0],      # ← 车舱温度 (T_cabin)
+        [0.0, -0.002, -0.002, 0.0],    # ← 电池温度 (T_battery)
+        [0.0, -0.002, 0.0, -0.002]     # ← 电机温度 (T_motor)
+    ])
+    #    ↓       ↓       ↓       ↓
+    #   RPM_    RPM_    RPM_    RPM_
+    #   blower  comp    batt    motor
+
+    # ========================================================================
+    # 8. MPC求解器配置
+    # ========================================================================
+    mpc_horizon: int = 5  # 预测视野
+    mpc_max_iter: int = 1000
+    mpc_tol: float = 1e-4
+    mpc_acceptable_tol: float = 1e-3
+
+    # ========================================================================
+    # 9. Step size配置
+    # ========================================================================
+    step_size_multiplier: int = 1  # 默认=1时等价于原功能
+
+    # ========================================================================
+    # 10. 观测和控制变量配置
+    # ========================================================================
+    observation_names: List[str] = field(default_factory=lambda: [
+        "cabinVolume.summary.T",
+        "battery.Batt_top[1].T",
+        "machine.heatCapacitor.T"
+    ])
+
+    action_names: List[str] = field(default_factory=lambda: [
+        "RPM_blower",
+        "RPM_comp",
+        "RPM_batt",
+        "RPM_motor"
+    ])
+
+    # FMU功耗变量名称
+    power_names: List[str] = field(default_factory=lambda: [
+        "TableDC3.Pe",       # 鼓风机功率
+        "TableDC.Pe",        # 压缩机功率
+        "TableDC1.Pe",       # 电池泵功率
+        "TableDC2.Pe"        # 电机泵功率
+    ])
+
+    # 额外监测变量名称
+    extra_var_names: List[str] = field(default_factory=lambda: [
+        "driverPerformance.controlBus.driverBus._acc_pedal_travel",    # 油门踏板
+        "driverPerformance.controlBus.driverBus._brake_pedal_travel",  # 制动踏板
+        "driverPerformance.controlBus.vehicleStatus.vehicle_velocity",  # 车速
+        "battery.controlBus.batteryBus.battery_SOC[1]",                # 电池SOC
+        "fan2Table.qflow"                                               # 鼓风机流量 (m^3/h)
+    ])
+
+    # ========================================================================
+    # 11. 温度边界
+    # ========================================================================
+    temp_bounds: Tuple[float, float] = (10.0, 60.0)  # 单位: °C
+
+    # ========================================================================
+    # 12. 仿真状态初始值（仅仿真模式下使用）
+    # ========================================================================
+    sim_state_init_cabin: float = 35.0   # °C
+    sim_state_init_battery: float = 35.0 # °C
+    sim_state_init_motor: float = 40.0   # °C
+    sim_state_noise_std: float = 0.5     # 标准差
+
+    def __post_init__(self):
+        """初始化后的验证和处理。"""
+        self._validate_config()
+        self._build_derived_matrices()
+
+    def _validate_config(self):
+        """验证配置的有效性。"""
+        # 检查维度
+        assert len(self.warmup_rpm) == 4, "warmup_rpm 必须有4个元素"
+        assert len(self.rpm_bounds) == 4, "rpm_bounds 必须有4个元组"
+        assert len(self.delta_rpm_bounds) == 4, "delta_rpm_bounds 必须有4个元组"
+        assert len(self.cost_q_diag) == 3, "cost_q_diag 必须有3个元素"
+        assert len(self.cost_r_diag) == 4, "cost_r_diag 必须有4个元素"
+        assert len(self.dynamics_b_matrix) == 3, "B矩阵必须有3行"
+        assert all(len(row) == 4 for row in self.dynamics_b_matrix), "B矩阵每行必须有4列"
+
+        # 检查温度目标
+        assert 'cabin' in self.temp_targets
+        assert 'battery' in self.temp_targets
+        assert 'motor' in self.temp_targets
+
+        # 检查变量名数量
+        assert len(self.observation_names) == 3, "观测变量必须有3个"
+        assert len(self.action_names) == 4, "控制变量必须有4个"
+        assert len(self.power_names) == 4, "功耗变量必须有4个"
+        assert len(self.extra_var_names) == 5, "额外变量必须有5个"
+
+        print("✅ 配置验证通过")
+
+    def _build_derived_matrices(self):
+        """构建派生的矩阵（从配置中计算）。"""
+        # Q矩阵：对角矩阵
+        self.cost_Q = np.diag(self.cost_q_diag)
+
+        # R矩阵：对角矩阵
+        self.cost_R = np.diag(self.cost_r_diag)
+
+        # A矩阵：对角矩阵（衰减）
+        self.dynamics_A = np.eye(3) * self.dynamics_a_decay
+
+        # B矩阵：转换为numpy数组
+        self.dynamics_B = np.array(self.dynamics_b_matrix, dtype=float)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """将配置转换为字典（便于保存和查看）。"""
+        return {
+            'fmu_path': self.fmu_path,
+            'warmup_steps': self.warmup_steps,
+            'warmup_rpm': self.warmup_rpm,
+            'rpm_bounds': self.rpm_bounds,
+            'delta_rpm_bounds': self.delta_rpm_bounds,
+            'temp_targets': self.temp_targets,
+            'cost_q_diag': self.cost_q_diag,
+            'cost_r_diag': self.cost_r_diag,
+            'cost_alpha_power': self.cost_alpha_power,
+            'dynamics_a_decay': self.dynamics_a_decay,
+            'mpc_horizon': self.mpc_horizon,
+            'step_size_multiplier': self.step_size_multiplier,
+        }
+
+    def save_to_json(self, filepath: str):
+        """将配置保存为JSON文件。"""
+        config_dict = self.to_dict()
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(config_dict, f, indent=2, ensure_ascii=False)
+        print(f"✅ 配置已保存到: {filepath}")
+
+    @classmethod
+    def load_from_json(cls, filepath: str) -> 'ThermalConfig':
+        """从JSON文件加载配置。"""
+        with open(filepath, 'r', encoding='utf-8') as f:
+            config_dict = json.load(f)
+        # 只加载已知的字段
+        config_dict = {k: v for k, v in config_dict.items() if k in cls.__dataclass_fields__}
+        print(f"✅ 配置已从 {filepath} 加载")
+        return cls(**config_dict)
+
 
 # ============================================================================
 # 成本函数
@@ -121,51 +321,24 @@ class ThermalMPCCost:
     - alpha_power: 功耗权重系数
     """
 
-    def __init__(
-        self,
-        T_cabin_set: float = 25.0,
-        T_bat_set: float = 35.0,
-        T_motor_set: float = 40.0,
-        Q: Optional[np.ndarray] = None,
-        R: Optional[np.ndarray] = None,
-        alpha_power: float = 1e-4
-    ):
+    def __init__(self, config: ThermalConfig):
         """
         参数说明
         ----------
-        T_cabin_set, T_bat_set, T_motor_set : float
-            车舱、电池、电机的目标温度（单位: °C）
-        Q : np.ndarray, 可选
-            状态误差权重矩阵（3x3）
-            - 对角线元素越大，该状态对成本的贡献越大
-            - 建议值范围: 0.1 ~ 100.0
-        R : np.ndarray, 可选
-            控制增量权重矩阵（4x4）
-            - 对角线元素越大，越倾向于平稳控制（增量小）
-            - 建议值范围: 0.001 ~ 1.0
-        alpha_power : float
-            功耗惩罚的权重系数
-            - 建议值范围: 1e-6 ~ 1e-2
+        config : ThermalConfig
+            集中式配置对象
         """
+        self.config = config
+
         self.x_ref = np.array([
-            T_cabin_set,
-            T_bat_set,
-            T_motor_set
+            config.temp_targets['cabin'],
+            config.temp_targets['battery'],
+            config.temp_targets['motor']
         ], dtype=float)
 
-        if Q is None:
-            # 默认权重：车舱权重更大（舒适性优先）
-            self.Q = np.diag([10.0, 5.0, 5.0])
-        else:
-            self.Q = Q
-
-        if R is None:
-            # 增量控制的权重：对转速变化的惩罚
-            self.R = np.diag([0.1, 0.1, 0.1, 0.1])
-        else:
-            self.R = R
-
-        self.alpha_power = alpha_power
+        self.Q = config.cost_Q
+        self.R = config.cost_R
+        self.alpha_power = config.cost_alpha_power
 
     def stage_cost(self, x: np.ndarray, delta_u: np.ndarray,
                    power_dict: Optional[Dict[str, float]] = None) -> float:
@@ -207,7 +380,7 @@ class ThermalMPCCost:
             power_cost = self.alpha_power * total_power
         else:
             power_cost = 0.0
-
+        print(state_cost, control_cost, power_cost)
         return float(state_cost + control_cost + power_cost)
 
 
@@ -218,55 +391,34 @@ class MPCThermalSystem:
     """
     用于MPC的简化系统模型，包装FMU观测。
     只用于轨迹预测，实际动态在FMU中。
-    
+
     【优化说明】
     改进了B矩阵的系数以更好地反映实际系统响应，
     特别是增强了电机控制的响应性。
     """
 
-    def __init__(
-        self,
-        n: int = 3,
-        m: int = 4,
-        dt: float = 1.0,
-        rpm_bounds: Optional[List[Tuple]] = None,
-        delta_rpm_bounds: Optional[List[Tuple]] = None
-    ):
+    def __init__(self, config: ThermalConfig):
         """
         参数说明
         ----------
-        n : int
-            状态维数（温度：车舱、电池、电机）
-        m : int
-            控制维数（4个泵/压缩机转速）
-        dt : float
-            采样时间（秒）
-        rpm_bounds : list of tuples
-            绝对转速边界 [(min1, max1), (min2, max2), ...]
-        delta_rpm_bounds : list of tuples
-            增量转速边界 [(min1, max1), (min2, max2), ...]
+        config : ThermalConfig
+            集中式配置对象
         """
-        self.n = n
-        self.m = m
-        self.dt = dt
+        self.config = config
+        self.n = 3  # 状态维数（温度：车舱、电池、电机）
+        self.m = 4  # 控制维数（4个泵/压缩机转速）
+        self.dt = 1.0  # 采样时间（秒）
 
-        # 成本函数权重
-        self.Q = np.diag([10.0, 5.0, 5.0])
-        self.R = np.diag([0.1, 0.1, 0.1, 0.1])  # 增量控制的权重
+        # 从配置加载矩阵
+        self.A = config.dynamics_A
+        self.B = config.dynamics_B
+        self.Q = config.cost_Q
+        self.R = config.cost_R
 
         # 边界
-        self.temp_bounds = (10.0, 60.0)  # 单位: °C
-
-        # 转速边界
-        if rpm_bounds is None:
-            self.rpm_bounds = [(0.0, 5000.0) for _ in range(m)]
-        else:
-            self.rpm_bounds = rpm_bounds if isinstance(rpm_bounds[0], (tuple, list)) else [(rpm_bounds[0], rpm_bounds[1]) for _ in range(m)]
-
-        if delta_rpm_bounds is None:
-            self.delta_rpm_bounds = [(-500.0, 500.0) for _ in range(m)]
-        else:
-            self.delta_rpm_bounds = delta_rpm_bounds if isinstance(delta_rpm_bounds[0], (tuple, list)) else [(delta_rpm_bounds[0], delta_rpm_bounds[1]) for _ in range(m)]
+        self.temp_bounds = config.temp_bounds
+        self.rpm_bounds = config.rpm_bounds
+        self.delta_rpm_bounds = config.delta_rpm_bounds
 
         # 为了兼容archive的MPC类
         self.v_bounds = (0.0, 5000.0)
@@ -279,7 +431,7 @@ class MPCThermalSystem:
 
         state_cost = float(x.T @ self.Q @ x)
         control_cost = float(delta_u.T @ self.R @ delta_u)
-
+        print(state_cost, control_cost)
         return state_cost + control_cost
 
     def dynamics(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
@@ -288,23 +440,13 @@ class MPCThermalSystem:
         这是占位符；真实动态在FMU中实现。
 
         注意：这里的u是绝对转速，不是增量
-        
+
         【优化点1】改进B矩阵系数以增强电机控制响应性
         """
         x = np.asarray(x).flatten()
         u = np.asarray(u).flatten()
 
-        # 非常简单的衰减动态（不进行控制时温度缓慢回到环境温度）
-        A = np.eye(3) * 0.95
-        
-        # 【优化】改进了系数，特别是电机泵的影响被放大
-        B = np.array([
-            [0.002, 0.0, 0.0, 0.0],      # 车舱：受空调（鼓风机）影响增强
-            [0.0, 0.003, 0.002, 0.0],    # 电池：受压缩机和电池泵影响增强
-            [0.0, 0.001, 0.0, 0.004]     # 【优化】电机：电机泵的系数从0.002增加到0.004
-        ])
-
-        x_next = A @ x + B @ u
+        x_next = self.A @ x + self.B @ u
         x_next = np.clip(x_next, self.temp_bounds[0], self.temp_bounds[1])
 
         return x_next
@@ -377,21 +519,19 @@ class ThermalMPCControllerDelta:
 
     def __init__(self,
                  system: MPCThermalSystem,
-                 horizon: int = 5,
-                 cost_fn: Optional[ThermalMPCCost] = None):
+                 cost_fn: ThermalMPCCost):
         """
         参数说明
         ----------
         system : MPCThermalSystem
             用于预测的系统模型
-        horizon : int
-            预测视野（N）
-        cost_fn : ThermalMPCCost, 可选
-            成本函数（若为None则使用默认值）
+        cost_fn : ThermalMPCCost
+            成本函数
         """
         self.system = system
-        self.horizon = horizon
-        self.cost_fn = cost_fn or ThermalMPCCost()
+        self.horizon = system.config.mpc_horizon
+        self.cost_fn = cost_fn
+        self.config = system.config
         self.last_solution = None
 
         self._build_nlp()
@@ -422,7 +562,8 @@ class ThermalMPCControllerDelta:
             # 使用列表推导式构建约束后的控制值
             u_clipped_list = []
             for j in range(m):
-                u_j_clipped = ca.fmax(ca.fmin(u[j], self.system.rpm_bounds[j][1]), self.system.rpm_bounds[j][0])
+                u_j_clipped = ca.fmax(ca.fmin(u[j], self.system.rpm_bounds[j][1]),
+                                     self.system.rpm_bounds[j][0])
                 u_clipped_list.append(u_j_clipped)
 
             # 使用 ca.vertcat 构建列向量
@@ -431,18 +572,13 @@ class ThermalMPCControllerDelta:
             # 单步成本（使用带符号的误差）
             x_ref = ca.DM(self.cost_fn.x_ref)
             error = x - x_ref
-            state_cost = ca.mtimes([error.T, self.system.Q, error])
-            control_cost = ca.mtimes([dU_i.T, self.system.R, dU_i])
+            state_cost = ca.mtimes([error.T, ca.DM(self.system.Q), error])
+            control_cost = ca.mtimes([dU_i.T, ca.DM(self.system.R), dU_i])
             J += state_cost + control_cost
 
-            # 简单的线性动态预测（使用约束后的控制值）
-            A = ca.DM(np.eye(3) * 0.95)
-            # 【优化】使用改进后的B矩阵
-            B = ca.DM(np.array([
-                [0.002, 0.0, 0.0, 0.0],
-                [0.0, 0.003, 0.002, 0.0],
-                [0.0, 0.001, 0.0, 0.004]
-            ]))
+            # 线性动态预测（使用约束后的控制值）
+            A = ca.DM(self.system.A)
+            B = ca.DM(self.system.B)
 
             x = A @ x + B @ u_clipped
 
@@ -468,9 +604,9 @@ class ThermalMPCControllerDelta:
             'ipopt.print_level': 0,
             'ipopt.sb': 'yes',
             'print_time': 0,
-            'ipopt.max_iter': 1000,
-            'ipopt.tol': 1e-4,  # 降低精度要求以加快求解
-            'ipopt.acceptable_tol': 1e-3,
+            'ipopt.max_iter': self.config.mpc_max_iter,
+            'ipopt.tol': self.config.mpc_tol,
+            'ipopt.acceptable_tol': self.config.mpc_acceptable_tol,
             'ipopt.warm_start_init_point': 'yes',
         }
 
@@ -570,7 +706,8 @@ class ThermalMPCControllerDelta:
             u_curr = u_traj[:, i] + delta_u_seq[:, i]
             # 应用每个部件的边界约束
             for j in range(m):
-                u_curr[j] = np.clip(u_curr[j], self.system.rpm_bounds[j][0], self.system.rpm_bounds[j][1])
+                u_curr[j] = np.clip(u_curr[j], self.system.rpm_bounds[j][0],
+                                   self.system.rpm_bounds[j][1])
             u_traj[:, i + 1] = u_curr
 
             # 计算成本
@@ -597,71 +734,24 @@ class EnhancedFMUITMS:
     - 功耗和其他变量从FMU中直接获取
     """
 
-    def __init__(
-        self,
-        fmu_path: Optional[str] = None,
-        step_size: float = 1.0,
-        observation_names: Optional[List[str]] = None,
-        action_names: Optional[List[str]] = None,
-        power_names: Optional[List[str]] = None,
-        extra_var_names: Optional[List[str]] = None,
-        init_dict: Optional[Dict[str, Any]] = None,
-        max_steps: int = 600
-    ):
+    def __init__(self, config: ThermalConfig):
         """
         参数说明
         ----------
-        fmu_path : str, 可选
-            .fmu文件路径。若为None，进入仅仿真模式
-        step_size : float
-            FMU步长（秒）
-        observation_names : list of str
-            观测的温度变量名称
-        action_names : list of str
-            控制的变量名称（4个泵/压缩机）
-        power_names : list of str
-            功耗的变量名称
-        extra_var_names : list of str
-            额外的监测变量（踏板行程、车速、SOC、鼓风机流量等）
-        init_dict : dict
-            FMU变量的初始值
-        max_steps : int
-            每个episode的最大仿真步数
+        config : ThermalConfig
+            集中式配置对象
         """
-        self.fmu_path = pathlib.Path(fmu_path) if fmu_path else None
-        self.step_size = step_size
+        self.config = config
+        self.fmu_path = pathlib.Path(config.fmu_path) if config.fmu_path else None
+        self.step_size = 1.0
 
         # 观测和控制变量名称
-        self.observation_names = observation_names or [
-            "cabinVolume.summary.T",
-            "battery.Batt_top[1].T",
-            "machine.heatCapacitor.T"
-        ]
-        self.action_names = action_names or [
-            "RPM_blower",
-            "RPM_comp",
-            "RPM_batt",
-            "RPM_motor"
-        ]
-        # 功耗变量名称（从FMU获取）
-        # 对应关系：TableDC3->鼓风机, TableDC->压缩机, TableDC1->电池泵, TableDC2->电机泵
-        self.power_names = power_names or [
-            "TableDC3.Pe",       # 鼓风机功率
-            "TableDC.Pe",        # 压缩机功率
-            "TableDC1.Pe",       # 电池泵功率
-            "TableDC2.Pe"        # 电机泵功率
-        ]
-        # 额外监测变量（包括鼓风机流量）
-        self.extra_var_names = extra_var_names or [
-            "driverPerformance.controlBus.driverBus._acc_pedal_travel",    # 油门踏板
-            "driverPerformance.controlBus.driverBus._brake_pedal_travel",  # 制动踏板
-            "driverPerformance.controlBus.vehicleStatus.vehicle_velocity",  # 车速
-            "battery.controlBus.batteryBus.battery_SOC[1]",                # 电池SOC
-            "fan2Table.qflow"                                               # 鼓风机流量 (m^3/h)
-        ]
+        self.observation_names = config.observation_names
+        self.action_names = config.action_names
+        self.power_names = config.power_names
+        self.extra_var_names = config.extra_var_names
 
-        self.init_dict = init_dict
-        self.max_steps = max_steps
+        self.max_steps = config.max_steps
 
         self.n_obs = len(self.observation_names)
         self.n_act = len(self.action_names)
@@ -704,8 +794,11 @@ class EnhancedFMUITMS:
         self.current_time = 0.0
         self._last_obs = None
         # 仿真模式下的状态（初始温度，单位: °C）
-        # 【优化2】添加cabin初始温度
-        self._sim_state = np.array([25.0, 35.0, 40.0])
+        self._sim_state = np.array([
+            config.sim_state_init_cabin,
+            config.sim_state_init_battery,
+            config.sim_state_init_motor
+        ])
 
     def _build_vr_map(self):
         """构建变量名到valueReference的映射。"""
@@ -728,23 +821,27 @@ class EnhancedFMUITMS:
             self._fmu.setupExperiment(startTime=0.0)
             self._fmu.enterInitializationMode()
 
-            if self.init_dict:
-                for k, v in self.init_dict.items():
-                    if k in self.vrs:
-                        self._fmu.setReal([self.vrs[k][0]], [float(v)])
+            # 设置初始温度
+            init_dict = {
+                'MY_socinit': 0.5,
+                'MY_battT0': self.config.init_battery_temp_K,
+                'MY_motorT0': self.config.init_motor_temp_K,
+                'MY_cabinT0': self.config.init_cabin_temp_K
+            }
+
+            for k, v in init_dict.items():
+                if k in self.vrs:
+                    self._fmu.setReal([self.vrs[k][0]], [float(v)])
 
             self._fmu.exitInitializationMode()
         except Exception as e:
             warnings.warn(f"未能创建FMU实例: {e}")
             self.fmu_available = False
 
-    def reset(self, init_dict: Optional[Dict] = None, seed: Optional[int] = None):
+    def reset(self, seed: Optional[int] = None):
         """重置环境并返回初始观测。"""
         if seed is not None:
             np.random.seed(seed)
-
-        if init_dict is not None:
-            self.init_dict = init_dict
 
         self.current_step = 0
         self.current_time = 0.0
@@ -757,7 +854,11 @@ class EnhancedFMUITMS:
             self._create_fmu_instance()
         else:
             # 仅仿真模式：初始化状态
-            self._sim_state = np.array([25.0, 35.0, 40.0]) + np.random.randn(3) * 0.5
+            self._sim_state = np.array([
+                self.config.sim_state_init_cabin,
+                self.config.sim_state_init_battery,
+                self.config.sim_state_init_motor
+            ]) + np.random.randn(3) * self.config.sim_state_noise_std
 
         # 如果FMU不可用，返回虚拟初始观测
         obs = self._read_observations()
@@ -925,16 +1026,8 @@ class EnhancedFMUITMS:
             ])
 
             # 简单的线性动态（基于MPC系统模型）
-            A = np.eye(3) * 0.95
-            # 【优化】使用改进后的B矩阵
-            B = np.array([
-                [0.002, 0.0, 0.0, 0.0],
-                [0.0, 0.003, 0.002, 0.0],
-                [0.0, 0.001, 0.0, 0.004]
-            ])
-
-            self._sim_state = A @ self._sim_state + B @ u
-            self._sim_state = np.clip(self._sim_state, 10.0, 60.0)
+            self._sim_state = self.config.dynamics_A @ self._sim_state + self.config.dynamics_B @ u
+            self._sim_state = np.clip(self._sim_state, self.config.temp_bounds[0], self.config.temp_bounds[1])
 
         # 读取观测（温度已是摄氏度）
         obs = self._read_observations()
@@ -979,58 +1072,21 @@ class EnhancedFMUITMS:
 # 主要仿真和绘图
 # ============================================================================
 def run_thermal_mpc_simulation(
-    fmu_path: Optional[str] = None,
+    config: ThermalConfig,
     sim_steps: int = 280,
-    horizon: int = 5,
     seed: int = 42,
-    controller_name: str = "增量型MPC (N=5)",
-    warmup_steps: int = WARMUP_STEPS,
-    warmup_rpm: Union[float, int, List] = WARMUP_RPM,
-    delta_rpm_bounds: Union[Tuple, List] = DELTA_RPM_BOUNDS,
-    rpm_bounds: Union[Tuple, List] = RPM_BOUNDS,
-    cost_q: Optional[np.ndarray] = None,
-    cost_r: Optional[np.ndarray] = None,
-    cost_alpha_power: float = COST_ALPHA_POWER,
-    step_size_multiplier: int = 1
 ) -> Dict:
     """
     运行MPC控制的热管理FMU仿真。
 
     参数说明
     ----------
-    fmu_path : str, 可选
-        FMU文件路径。若为None，进入仅仿真模式
+    config : ThermalConfig
+        集中式配置对象
     sim_steps : int
         仿真步数（不包括预热步数）
-    horizon : int
-        MPC预测视野
     seed : int
         随机种子
-    controller_name : str
-        控制器名称（用于绘图标签）
-    warmup_steps : int
-        FMU预热步数（不施加MPC控制）
-    warmup_rpm : float, int, or list
-        预热阶段的固定RPM值
-    delta_rpm_bounds : tuple or list of tuples
-        增量约束
-    rpm_bounds : tuple or list of tuples
-        绝对转速约束
-    cost_q : np.ndarray
-        成本函数的Q矩阵
-    cost_r : np.ndarray
-        成本函数的R矩阵
-    cost_alpha_power : float
-        功耗权重系数
-    step_size_multiplier : int
-        步长倍增系数。当>1时，每step_size_multiplier步执行一次MPC
-        
-    【优化说明】
-    当step_size_multiplier=1时，功能等同于原始代码
-    当step_size_multiplier>1时：
-      - warmup_steps 被除以 step_size_multiplier
-      - 每隔 step_size_multiplier 步执行一次MPC
-      - plot记录所有FMU步骤的观察值
 
     返回值
     -------
@@ -1039,14 +1095,11 @@ def run_thermal_mpc_simulation(
     """
     np.random.seed(seed)
 
-    # 转换参数
-    warmup_rpm_array = convert_warmup_rpm(warmup_rpm)
-    delta_rpm_bounds_list = convert_bounds(delta_rpm_bounds)
-    rpm_bounds_list = convert_bounds(rpm_bounds)
-
     # 【优化3】处理step_size_multiplier
+    step_size_multiplier = config.step_size_multiplier
+    warmup_steps = config.warmup_steps
     warmup_steps_adjusted = max(1, warmup_steps // step_size_multiplier)
-    
+
     print(f"\n【信息】step_size_multiplier = {step_size_multiplier}")
     if step_size_multiplier > 1:
         print(f"  原始 warmup_steps = {warmup_steps}")
@@ -1054,66 +1107,30 @@ def run_thermal_mpc_simulation(
         print(f"  每 {step_size_multiplier} 步执行一次MPC控制")
 
     # 初始化系统和控制器
-    sys = MPCThermalSystem(
-        n=3,
-        m=4,
-        dt=1.0,
-        rpm_bounds=rpm_bounds_list,
-        delta_rpm_bounds=delta_rpm_bounds_list
-    )
+    sys = MPCThermalSystem(config)
 
-    if cost_q is None:
-        cost_q = COST_Q
-    if cost_r is None:
-        cost_r = COST_R
-
-    cost_fn = ThermalMPCCost(
-        T_cabin_set=TEMP_TARGETS['cabin'],
-        T_bat_set=TEMP_TARGETS['battery'],
-        T_motor_set=TEMP_TARGETS['motor'],
-        Q=cost_q,
-        R=cost_r,
-        alpha_power=cost_alpha_power
-    )
-    controller = ThermalMPCControllerDelta(
-        sys,
-        horizon=horizon,
-        cost_fn=cost_fn
-    )
+    cost_fn = ThermalMPCCost(config)
+    controller = ThermalMPCControllerDelta(sys, cost_fn)
 
     # 初始化FMU环境
-    # 【优化2】添加cabin温度初始化
-    init_dict = {
-        'MY_socinit': 0.5,
-        'MY_battT0': 303.15,      # 电池初始温度30°C (开尔文)
-        'MY_motorT0': 333.15,     # 电机初始温度60°C (开尔文)
-        'MY_cabinT0': 298.15      # 【优化】车舱初始温度25°C (开尔文)
-    }
-
-    # 计算总FMU步数（不考虑multiplier）
-    total_fmu_steps = warmup_steps + sim_steps
-    
-    env = EnhancedFMUITMS(
-        fmu_path=fmu_path,
-        step_size=1.0,
-        init_dict=init_dict,
-        max_steps=total_fmu_steps
-    )
+    env = EnhancedFMUITMS(config)
 
     # 运行仿真
+    controller_name = f"增量型MPC (N={config.mpc_horizon}, step_size={step_size_multiplier})"
     print(f"\n开始 {controller_name} 仿真")
     print(f"预热阶段: {warmup_steps_adjusted} 步（MPC控制周期）")
-    print(f"  - RPM设定: blower={warmup_rpm_array[0]:.0f}, comp={warmup_rpm_array[1]:.0f}, "
-          f"batt={warmup_rpm_array[2]:.0f}, motor={warmup_rpm_array[3]:.0f}")
+    print(f"  - RPM设定: blower={config.warmup_rpm[0]:.0f}, comp={config.warmup_rpm[1]:.0f}, "
+          f"batt={config.warmup_rpm[2]:.0f}, motor={config.warmup_rpm[3]:.0f}")
     print(f"MPC控制: {sim_steps // step_size_multiplier} 步（MPC控制周期）")
-    print(f"  - 预测视野: {horizon}")
+    print(f"  - 预测视野: {config.mpc_horizon}")
     print(f"  - 增量约束与绝对转速约束已配置")
     print("=" * 150)
 
-    obs = env.reset(init_dict, seed=seed)
+    obs = env.reset(seed=seed)
     x_k = env.obs_to_array(obs)
 
     # 【优化3】使用FMU实际步数初始化历史
+    total_fmu_steps = warmup_steps + sim_steps
     x_history = np.zeros((3, total_fmu_steps + 1))
     u_history = np.zeros((4, total_fmu_steps))
     delta_u_history = np.zeros((4, total_fmu_steps))
@@ -1125,7 +1142,7 @@ def run_thermal_mpc_simulation(
     x_history[:, 0] = x_k
 
     # 初始化控制值
-    u_current = warmup_rpm_array.copy()
+    u_current = np.array(config.warmup_rpm, dtype=float)
     u_history[:, 0] = u_current
 
     # 使用tqdm显示进度条
@@ -1140,7 +1157,7 @@ def run_thermal_mpc_simulation(
         is_warmup = k < warmup_steps_adjusted * step_size_multiplier
 
         if is_warmup:
-            u_k = warmup_rpm_array.copy()
+            u_k = np.array(config.warmup_rpm, dtype=float)
             delta_u_k = np.zeros(4)
             phase_label = "预热"
         elif is_mpc_step:
@@ -1161,7 +1178,7 @@ def run_thermal_mpc_simulation(
         # 更新绝对控制值
         u_k = u_current + delta_u_k
         for j in range(4):
-            u_k[j] = np.clip(u_k[j], rpm_bounds_list[j][0], rpm_bounds_list[j][1])
+            u_k[j] = np.clip(u_k[j], config.rpm_bounds[j][0], config.rpm_bounds[j][1])
 
         # 步进环境
         action = env.action_array_to_dict(u_k)
@@ -1185,7 +1202,11 @@ def run_thermal_mpc_simulation(
         extra_vars_history[k, 3] = extra_vars.get('battery_SOC[1]', 0.5)
         extra_vars_history[k, 4] = extra_vars.get('qflow', 0.0)
 
-        temp_errors = x_next - np.array([TEMP_TARGETS['cabin'], TEMP_TARGETS['battery'], TEMP_TARGETS['motor']])
+        temp_errors = x_next - np.array([
+            config.temp_targets['cabin'],
+            config.temp_targets['battery'],
+            config.temp_targets['motor']
+        ])
 
         pbar.set_postfix({
             '阶段': phase_label,
@@ -1235,15 +1256,7 @@ def run_thermal_mpc_simulation(
         'fmu_available': env.fmu_available,
         'warmup_steps': warmup_steps_adjusted * step_size_multiplier,
         'mpc_steps': len(timestamps) - warmup_steps_adjusted * step_size_multiplier,
-        'action_names': env.action_names,
-        'warmup_rpm': warmup_rpm_array,
-        'delta_rpm_bounds': delta_rpm_bounds_list,
-        'rpm_bounds': rpm_bounds_list,
-        'cost_q': cost_q if cost_q is not None else COST_Q,
-        'cost_r': cost_r if cost_r is not None else COST_R,
-        'cost_alpha_power': cost_alpha_power,
-        'temp_targets': TEMP_TARGETS,
-        'step_size_multiplier': step_size_multiplier
+        'config': config,
     }
 
     return results
@@ -1264,7 +1277,10 @@ def plot_thermal_mpc_results(results: Dict):
     controller_name = results.get('controller_name', 'MPC')
     fmu_available = results.get('fmu_available', False)
     warmup_steps = results.get('warmup_steps', 0)
-    action_names = results.get('action_names', ['RPM_blower', 'RPM_comp', 'RPM_batt', 'RPM_motor'])
+    config = results['config']
+
+    action_names = config.action_names
+    temp_targets = config.temp_targets
 
     n_steps = x_hist.shape[1] - 1
     time_x = np.arange(x_hist.shape[1])
@@ -1285,9 +1301,9 @@ def plot_thermal_mpc_results(results: Dict):
     ax1.plot(time_x, x_hist[0, :], 'b-', linewidth=2, label='车舱温度')
     ax1.plot(time_x, x_hist[1, :], 'r-', linewidth=2, label='电池温度')
     ax1.plot(time_x, x_hist[2, :], 'g-', linewidth=2, label='电机温度')
-    ax1.axhline(25.0, color='b', linestyle='--', alpha=0.3)
-    ax1.axhline(35.0, color='r', linestyle='--', alpha=0.3)
-    ax1.axhline(40.0, color='g', linestyle='--', alpha=0.3)
+    ax1.axhline(temp_targets['cabin'], color='b', linestyle='--', alpha=0.3)
+    ax1.axhline(temp_targets['battery'], color='r', linestyle='--', alpha=0.3)
+    ax1.axhline(temp_targets['motor'], color='g', linestyle='--', alpha=0.3)
     if warmup_steps > 0:
         ax1.axvline(warmup_steps, color='orange', linestyle=':', linewidth=2, alpha=0.7)
     ax1.set_ylabel('温度 (°C)', fontsize=10)
@@ -1385,7 +1401,7 @@ def plot_thermal_mpc_results(results: Dict):
 
     # ---- 第7个subplot: 温度跟踪误差（带符号） ----
     ax7 = plt.subplot(4, 2, 7)
-    targets = np.array([TEMP_TARGETS['cabin'], TEMP_TARGETS['battery'], TEMP_TARGETS['motor']])
+    targets = np.array([temp_targets['cabin'], temp_targets['battery'], temp_targets['motor']])
     signed_errors = x_hist - targets.reshape(-1, 1)
 
     ax7.plot(time_x, signed_errors[0, :], linewidth=2, label='车舱误差')
@@ -1402,7 +1418,7 @@ def plot_thermal_mpc_results(results: Dict):
 
     # ---- 第8个subplot: 增量约束监测 ----
     ax8 = plt.subplot(4, 2, 8)
-    delta_bounds = results.get('delta_rpm_bounds', [(-500, 500) for _ in range(4)])
+    delta_bounds = config.delta_rpm_bounds
     colors_names = ['blower', 'comp', 'batt', 'motor']
 
     for i, (delta, name, color) in enumerate(zip(delta_u_hist, colors_names, colors_rpm)):
@@ -1446,33 +1462,31 @@ def print_summary_statistics(results: Dict):
     fmu_available = results.get('fmu_available', False)
     warmup_steps = results.get('warmup_steps', 0)
     mpc_steps = results.get('mpc_steps', 0)
-    action_names = results.get('action_names', ['RPM_blower', 'RPM_comp', 'RPM_batt', 'RPM_motor'])
-    warmup_rpm = results.get('warmup_rpm', np.array([1000, 1000, 1000, 1000]))
-    delta_rpm_bounds = results.get('delta_rpm_bounds', [(-500, 500) for _ in range(4)])
-    rpm_bounds = results.get('rpm_bounds', [(0, 5000) for _ in range(4)])
-    step_size_multiplier = results.get('step_size_multiplier', 1)
+    config = results['config']
 
     mode_str = "FMU" if fmu_available else "仿真模式"
-    temp_targets = results.get('temp_targets', TEMP_TARGETS)
+    temp_targets = config.temp_targets
     targets = np.array([temp_targets['cabin'], temp_targets['battery'], temp_targets['motor']])
+    action_names = config.action_names
+    power_names_short = ['鼓风机', '压缩机', '电池泵', '电机泵']
 
     print("\n" + "=" * 150)
     print(f"仿真摘要统计 - {controller_name} [{mode_str}]")
     print("=" * 150)
 
     print(f"\n仿真配置:")
-    print(f"  step_size_multiplier: {step_size_multiplier}")
+    print(f"  step_size_multiplier: {config.step_size_multiplier}")
     print(f"  预热阶段: {warmup_steps} 步（MPC控制周期）")
-    print(f"    - 实际FMU步数: {warmup_steps * step_size_multiplier}")
-    print(f"    - RPM设定: blower={warmup_rpm[0]:.0f}, comp={warmup_rpm[1]:.0f}, "
-          f"batt={warmup_rpm[2]:.0f}, motor={warmup_rpm[3]:.0f}")
+    print(f"    - 实际FMU步数: {warmup_steps * config.step_size_multiplier}")
+    print(f"    - RPM设定: blower={config.warmup_rpm[0]:.0f}, comp={config.warmup_rpm[1]:.0f}, "
+          f"batt={config.warmup_rpm[2]:.0f}, motor={config.warmup_rpm[3]:.0f}")
     print(f"  MPC控制阶段: {mpc_steps} 步（MPC控制周期）")
-    print(f"    - 实际FMU步数: {mpc_steps * step_size_multiplier}")
+    print(f"    - 实际FMU步数: {mpc_steps * config.step_size_multiplier}")
     print(f"    - 增量约束:")
-    for i, (name, bounds) in enumerate(zip(['blower', 'comp', 'batt', 'motor'], delta_rpm_bounds)):
+    for i, (name, bounds) in enumerate(zip(['blower', 'comp', 'batt', 'motor'], config.delta_rpm_bounds)):
         print(f"      {name:>6}: [{bounds[0]:+6.0f}, {bounds[1]:+6.0f}] RPM/step")
     print(f"    - 绝对转速约束:")
-    for i, (name, bounds) in enumerate(zip(['blower', 'comp', 'batt', 'motor'], rpm_bounds)):
+    for i, (name, bounds) in enumerate(zip(['blower', 'comp', 'batt', 'motor'], config.rpm_bounds)):
         print(f"      {name:>6}: [{bounds[0]:6.0f}, {bounds[1]:6.0f}] RPM")
     print(f"  总步数: {len(cost_hist)}")
 
@@ -1518,7 +1532,6 @@ def print_summary_statistics(results: Dict):
 
     # 功耗统计
     print(f"\n功耗分析（从FMU获取，控制阶段）:")
-    power_names_short = ['鼓风机', '压缩机', '电池泵', '电机泵']
     power_ctrl = power_hist[warmup_steps:]
     for i, name in enumerate(power_names_short):
         mean_p = np.mean(power_ctrl[:, i])
@@ -1544,17 +1557,16 @@ def print_summary_statistics(results: Dict):
     print(f"  平均单步成本: {np.mean(cost_ctrl):.4f}")
     print(f"  控制步数: {len(cost_ctrl)}")
 
-    # MPC 超参数
+    # MPC 超���数
     print(f"\nMPC 超参数:")
+    print(f"  预测视野: {config.mpc_horizon}")
     print(f"  成本权重矩阵 Q (状态权重):")
-    cost_q = results.get('cost_q', COST_Q)
-    for i in range(3):
-        print(f"    {cost_q[i, i]:.2f}")
+    for i, name in enumerate(['车舱', '电池', '电机']):
+        print(f"    {name}: {config.cost_q_diag[i]:.2f}")
     print(f"  成本权重矩阵 R (控制增量权重):")
-    cost_r = results.get('cost_r', COST_R)
-    for i in range(4):
-        print(f"    {cost_r[i, i]:.3f}")
-    print(f"  功耗权重系数 (alpha_power): {results.get('cost_alpha_power', COST_ALPHA_POWER):.2e}")
+    for i, name in enumerate(['blower', 'comp', 'batt', 'motor']):
+        print(f"    {name}: {config.cost_r_diag[i]:.3f}")
+    print(f"  功耗权重系数 (alpha_power): {config.cost_alpha_power:.2e}")
 
     print("=" * 150 + "\n")
 
@@ -1564,52 +1576,63 @@ def print_summary_statistics(results: Dict):
 # ============================================================================
 if __name__ == "__main__":
     print("\n" + "=" * 150)
-    print("短视野增量型MPC热管理系统控制（FMU）- 优化版本（支持step_size参数）")
+    print("短视野增量型MPC热管理系统控制（FMU）- 优化版本（参数管理集中化）")
     print("=" * 150 + "\n")
 
-    # 【示例1】基础运行（等同于原始代码）
-    print("\n【示例1】基础运行 (step_size_multiplier=1)")
+    # ========================================================================
+    # 方案1：使用默认配置
+    # ========================================================================
+    print("\n【方案1】使用默认配置运行")
+    config_default = ThermalConfig()
+
     results = run_thermal_mpc_simulation(
-        fmu_path=FMU_PATH,
-        sim_steps=100,
-        horizon=5,
+        config=config_default,
+        sim_steps=50,
         seed=42,
-        controller_name="增量型MPC (N=5)",
-        warmup_steps=WARMUP_STEPS,
-        warmup_rpm=WARMUP_RPM,
-        delta_rpm_bounds=DELTA_RPM_BOUNDS,
-        rpm_bounds=RPM_BOUNDS,
-        cost_q=COST_Q,
-        cost_r=COST_R,
-        cost_alpha_power=COST_ALPHA_POWER,
-        step_size_multiplier=1
     )
 
-    # 打印统计信息
     print_summary_statistics(results)
-
-    # 生成绘图
     plot_thermal_mpc_results(results)
 
-    print("\n所有结果已生成成功！")
+    # 【可选】保存配置到JSON
+    config_default.save_to_json('results/default_config.json')
 
-    # 【示例2】使用step_size=2（可选，取消注释运行）
-    # print("\n" + "=" * 150)
-    # print("【示例2】使用step_size_multiplier=2")
-    # results2 = run_thermal_mpc_simulation(
-    #     fmu_path=FMU_PATH,
-    #     sim_steps=100,
-    #     horizon=5,
-    #     seed=42,
-    #     controller_name="增量型MPC (N=5, step_size=2)",
-    #     warmup_steps=WARMUP_STEPS,
-    #     warmup_rpm=WARMUP_RPM,
-    #     delta_rpm_bounds=DELTA_RPM_BOUNDS,
-    #     rpm_bounds=RPM_BOUNDS,
-    #     cost_q=COST_Q,
-    #     cost_r=COST_R,
-    #     cost_alpha_power=COST_ALPHA_POWER,
-    #     step_size_multiplier=2
+    # ========================================================================
+    # 方案2：自定义配置
+    # ========================================================================
+    # 【示例】修改某个参数，其他保持默认
+    # print("\n【方案2】自定义配置 - 修改MPC视野和成本权重")
+    # config_custom = ThermalConfig(
+    #     mpc_horizon=8,  # 增加预测视野
+    #     cost_q_diag=[15.0, 8.0, 8.0],  # 增加温度权重
+    #     cost_alpha_power=5e-4,  # 增加功耗权重
+    #     step_size_multiplier=2  # 每2步执行一次MPC
     # )
+    #
+    # results2 = run_thermal_mpc_simulation(
+    #     config=config_custom,
+    #     sim_steps=100,
+    #     seed=42,
+    # )
+    #
     # print_summary_statistics(results2)
     # plot_thermal_mpc_results(results2)
+    # config_custom.save_to_json('results/custom_config.json')
+
+    # ========================================================================
+    # 方案3：从JSON加载配置
+    # ========================================================================
+    # 【示例】从之前保存的配置文件加载
+    # print("\n【方案3】从JSON配置文件加载")
+    # config_loaded = ThermalConfig.load_from_json('results/custom_config.json')
+    #
+    # results3 = run_thermal_mpc_simulation(
+    #     config=config_loaded,
+    #     sim_steps=100,
+    #     seed=42,
+    # )
+    #
+    # print_summary_statistics(results3)
+    # plot_thermal_mpc_results(results3)
+
+    print("\n所有结果已生成成功！")
