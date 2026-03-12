@@ -1,3 +1,36 @@
 1. 目前看到的运算结果，电机的温度在初始值60开始就一直微微往上到61、62,而控制理想温度设置为40，交给mpc控制时却发现一直将RPM_motor的控制增量设为最大负值，为什么呢？
 2. 目前fmu的初始化条件是使用一个固定的init_dict，其中有MY_socinit\MY_battT0\MY_motorT0，帮我也加入cabin的温度初始
 3. 增加逻辑：我现在想更换step size为大于1的值，我想让plot能记录下所有step的fmu观察值的同时，只在每个stepsize使用mpc去控制，值得一提的是，warmup steps应该要除以stepsize，并且当stepsize=1时功能等同于现在未增加逻辑的代码
+
+
+- buffer
+-   prior_buffer.py
+-   replay_buffer.py
+- config
+-   config_ddpg.py
+-   config_maddpg.py
+-   config_maddpgi2c.py
+- drivecycle
+-   CLTCP.txt
+-   WLTC.txt
+- env
+-   dummyenv.py
+-   fmu_env_itms.py
+-   MyITMS.fmu
+- model
+-   ddpg.py
+-   maddpg.py
+-   mlp_block.py
+-   prior
+- utils
+-   uitls.config.py
+-   utils_drivecycle.py
+-   utils_env.py
+-   utils_i2c.py
+-   utils_klvalue.py
+-   utils_misc.py
+-   utils_model.py
+-   utils_reward.py
+- trainer.py
+- export.py
+- restore.py
