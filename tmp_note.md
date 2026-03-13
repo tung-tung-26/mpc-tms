@@ -14,8 +14,8 @@
   -   CLTCP.txt
   -   WLTC.txt
 - env
-  -   dummyenv.py
-  -   fmu_env_itms.py
+  -   env_dummy.py
+  -   env_fmu.py
   -   MyITMS.fmu
 - model
   -   ddpg.py
